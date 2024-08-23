@@ -1,95 +1,124 @@
-use std::pin::Pin;
-use std::ptr::addr_of_mut;
+use std::fmt::Debug;
+use std::io::{stdin, Stdin, stdout, Stdout};
+use std::pin::pin;
 
-use duckdb::{params, Connection, Rows, Statement};
+use thiserror::Error;
+use duckdb::Connection;
 
-enum Command {
-    Prepare,
-    Query,
-    Fetch1,
-    Done,
+mod eval;
+mod input;
+mod output;
+
+use input::Command;
+use output::Response;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    JsonError(#[from] json::Error),
+
+    #[error(transparent)]
+    DbError(#[from] duckdb::Error),
+
+    #[error("eof")]
+    Eof,
+
+    #[error("{}", .0)]
+    General(&'static str),
 }
 
-const COMMANDS: &[Command] = &[
-    Command::Prepare,
-    Command::Query,
-    Command::Fetch1,
-    Command::Fetch1,
-    Command::Fetch1,
-    Command::Done,
-];
+pub type Result<T> = std::result::Result<T, Error>;
 
-struct StmtHandle<'a> {
-    stmt: Statement<'a>,
-    rows: Option<Rows<'a>>,
+fn err<T>(msg: &'static str) -> Result<T> {
+    Err(Error::General(msg))
 }
 
-impl<'a> StmtHandle<'a> {
-    fn new(stmt: Statement<'a>) -> Self {
-        StmtHandle { stmt, rows: None }
+struct Server<'a> {
+    stdin: &'a mut Stdin,
+    stdout: &'a mut Stdout,
+    db: Connection,
+}
+
+impl<'a> Server<'a> {
+    fn do_loop(&mut self) -> Result<()> {
+        output::write_response(self.stdout, Response::Ok)?;
+
+        loop {
+            let cmd = match input::read_command(self.stdin) {
+                Err(Error::Eof) => break,
+                Err(err) => {
+                    output::write_response(self.stdout, Response::Error(err))?;
+                    continue;
+                },
+                Ok(cmd) => cmd,
+            };
+
+            match self.do_cmd(cmd) {
+                Ok(()) => (),
+                Err(err) => output::write_response(self.stdout, Response::Error(err))?,
+            }
+        }
+
+        Ok(())
     }
 
-    fn build_rows<F>(mut self: Pin<&mut Self>, f: F)
-    where
-        F: FnOnce(&'a mut Statement<'a>) -> Rows<'a>,
-    {
-        // SAFETY: lifetime of `rows` will be the same as `stmt`, and it is
-        // not allowed to move via `Pin`, so taking a pointer in a self-referential
-        // fashion is okay.
-        let ptr_ref = unsafe {
-            let ptr = addr_of_mut!(self.stmt);
-            ptr.as_mut().unwrap()
+    fn do_cmd(&mut self, cmd: Command) -> Result<()> {
+        let resp = match cmd {
+            Command::Execute(query) => {
+                let affected_rows = eval::execute(&self.db, query)?;
+                Response::Done { affected_rows }
+            },
+            Command::QueryImmediate(query) => {
+                let mut sh = pin!(eval::prepare(&self.db, &query)?);
+                sh.as_mut().query(&query)?;
+                let (stride, values) = sh.as_mut().fetch_rows(usize::MAX)?;
+                let col_names = sh.as_ref().col_names();
+                Response::QueryRows {
+                    col_names: Some(col_names),
+                    stride: stride as u32,
+                    values,
+                }
+            },
+            Command::QueryHandle(_) => todo!(),
+            Command::QueryRow => todo!(),
+            Command::QueryRows(_) => todo!(),
+            Command::AppendPrepare(_) => todo!(),
+            Command::AppendRow(_, _) => todo!(),
+            Command::AppendRows(_, _) => todo!(),
+            Command::AppendFlush => todo!(),
         };
-        let rows = f(ptr_ref);
-        self.rows = Some(rows);
+        output::write_response(self.stdout, resp)?;
+        Ok(())
     }
+}
+
+fn do_main(r#in: &mut Stdin, r#out: &mut Stdout) -> Result<()> {
+    let db = {
+        let mut args = std::env::args();
+        if args.len() < 2 {
+            return err("not enough args");
+        }
+
+        Connection::open(args.nth(1).unwrap())?
+    };
+
+    let mut serv = Server {
+        stdin: r#in,
+        stdout: r#out,
+        db,
+    };
+    serv.do_loop()
 }
 
 fn main() {
-    let db = Connection::open_in_memory().unwrap();
+    let mut r#in = stdin();
+    let mut r#out = stdout();
 
-    let mut stmt_handle: Option<Pin<Box<StmtHandle<'_>>>> = None;
-
-    db.execute(
-        "
-        create table items (id integer primary key, name varchar)
-        ",
-        params![],
-    )
-    .unwrap();
-
-    {
-        let mut app = db.appender("items").unwrap();
-        app.append_rows([params![1, "one"], params![2, "two"], params![3, "three"]])
-            .unwrap();
-        app.flush().unwrap();
-    }
-
-    for command in COMMANDS {
-        match command {
-            Command::Prepare => {
-                let stmt = db.prepare("select * from items").unwrap();
-                let sh = StmtHandle::new(stmt);
-                stmt_handle = Some(Box::pin(sh));
-            }
-            Command::Query => {
-                let sh = stmt_handle.as_mut().unwrap();
-                sh.as_mut()
-                    .build_rows(|stmt| stmt.query(params![]).unwrap());
-            }
-            Command::Fetch1 => {
-                let sh = stmt_handle.as_mut().unwrap();
-
-                if let Some(row) = sh.rows.as_mut().unwrap().next().unwrap() {
-                    let id: i32 = row.get("id").unwrap();
-                    let name: String = row.get("name").unwrap();
-                    println!("got row: {}, {}", id, name);
-                }
-            }
-            Command::Done => {
-                // rows_handle = None;
-                stmt_handle = None;
-            }
-        }
-    }
+    do_main(&mut r#in, &mut r#out).map_err(|err| {
+        output::write_response(&mut r#out, Response::Error(err)).unwrap();
+        std::process::exit(1);
+    }).unwrap();
 }
