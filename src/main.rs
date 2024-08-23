@@ -1,121 +1,98 @@
-mod io;
-mod eval;
-mod map_value;
+use std::cell::RefCell;
+use std::rc::Rc;
 
-use thiserror::Error;
-use duckdb::Connection;
-use std::env::args;
-use std::fmt::Debug;
-use std::io::{stdin, stdout, Write};
-use json::{object, array, JsonValue, stringify};
+use duckdb::{params, Connection, Rows, Statement};
 
-#[derive(Error, Debug)]
-enum Error {
-    #[error("io error")]
-    Io(#[from] io::Error),
-
-    #[error("eval error")]
-    Eval(#[from] eval::Error),
-
-    #[error("duckdb error")]
-    DuckDb(#[from] duckdb::Error),
-
-    #[error("stdio error")]
-    StdIo(#[from] std::io::Error),
-
-    #[error("not enough args, expected 2")]
-    NotEnoughArgs,
+enum Command {
+    Prepare,
+    Query,
+    Fetch1,
+    Done,
 }
 
-fn connect() -> Result<Connection, Error> {
-    let path = args()
-        .nth(1)
-        .ok_or(Error::NotEnoughArgs)?;
+const COMMANDS: &[Command] = &[
+    Command::Prepare,
+    Command::Query,
+    Command::Fetch1,
+    Command::Fetch1,
+    Command::Fetch1,
+    Command::Done,
+];
 
-    Ok(Connection::open(path)?)
+type StatementCell<'a> = RefCell<Statement<'a>>;
+type StatementRc<'a> = Rc<StatementCell<'a>>;
+type RhRc<'a> = Rc<RefCell<RowsHandle<'a>>>;
+
+struct RowsHandle<'a> {
+    stmt_rc: Rc<RefCell<Statement<'a>>>,
+    rows: Option<Rows<'a>>,
 }
-
-fn main() -> Result<(), Error> {
-    let conn = connect()?;
-
-    let stdin = stdin();
-    let stdout = stdout();
-
-    loop {
-        let req = io::read_command(&stdin)?;
-        println!("request: {:?}", req);
-        let cmd = eval::parse(&req)?;
-        println!("command: {:?}", cmd);
-        eval_cmd(&conn, cmd)?
+impl<'a> RowsHandle<'a> {
+    // SAFETY: Skirts around ownership rules for Rc, so assumes that it will live long enough.
+    unsafe fn build_rows<F: FnOnce(&'a mut Statement<'a>) -> Rows<'a>>(&mut self, f: F) {
+        let ptr = self.stmt_rc.as_ptr();
+        let ptr_ref = ptr.as_mut().unwrap();
+        let rows = f(ptr_ref);
+        self.rows = Some(rows);
     }
 }
 
-fn eval_cmd(conn: &Connection, cmd: eval::Request) -> Result<(), Error> {
-    match cmd {
-        eval::Request::StartAppend(_) => todo!(),
-        eval::Request::EndAppend => todo!(),
-        eval::Request::AppendRow(_) => todo!(),
-        eval::Request::RunSql(sql, params) => eval_sql(conn, sql, params),
+fn main() {
+    let db = Connection::open_in_memory().unwrap();
+
+    let mut stmt_handle: Option<StatementRc<'_>> = None;
+    let mut rows_handle: Option<RhRc<'_>> = None;
+
+    db.execute(
+        "
+        create table items (id integer primary key, name varchar)
+        ",
+        params![],
+    )
+    .unwrap();
+
+    {
+        let mut app = db.appender("items").unwrap();
+        app.append_rows([params![1, "one"], params![2, "two"], params![3, "three"]])
+            .unwrap();
+        app.flush().unwrap();
     }
-}
 
-fn val_to_json(r: duckdb::types::ValueRef) -> JsonValue {
-    use duckdb::types::ValueRef as VR;
+    for command in COMMANDS {
+        match command {
+            Command::Prepare => {
+                let stmt = db.prepare("select * from items").unwrap();
+                stmt_handle = Some(Rc::new(RefCell::new(stmt)));
+            }
+            Command::Query => {
+                let stmt_rc = stmt_handle.as_ref().unwrap().clone();
 
-    match r {
-        VR::Null => JsonValue::Null,
-        VR::Boolean(val) => JsonValue::Boolean(val),
-        VR::TinyInt(val) => JsonValue::from(val),
-        VR::SmallInt(val) => JsonValue::from(val),
-        VR::Int(val) => JsonValue::from(val),
-        VR::BigInt(val) => JsonValue::from(val),
-        VR::HugeInt(_) => panic!("i128 conversion not implemented"),
-        VR::UTinyInt(val) => JsonValue::from(val),
-        VR::USmallInt(val) => JsonValue::from(val),
-        VR::UInt(val) => JsonValue::from(val),
-        VR::UBigInt(val) => JsonValue::from(val),
-        VR::Float(val) => JsonValue::from(val),
-        VR::Double(val) => JsonValue::from(val),
-        VR::Decimal(_) => panic!("decimal conversion not implemented"),
-        VR::Timestamp(_, _) => panic!("timestamp conversion not implemented"),
-        VR::Text(val) => JsonValue::String(unsafe { String::from_utf8_unchecked(Vec::from(val)) }),
-        VR::Blob(_) => todo!(),
-        VR::Date32(_) => todo!(),
-        VR::Time64(_, _) => todo!(),
-        VR::Interval { months: _, days: _, nanos: _ } => todo!(),
-        VR::List(_, _) => todo!(),
-        VR::Enum(_, _) => todo!(),
-        VR::Struct(_, _) => todo!(),
-        VR::Array(_, _) => todo!(),
-        VR::Map(_, _) => todo!(),
-        VR::Union(_, _) => todo!(),
-    }
-}
+                let mut rh = RowsHandle {
+                    stmt_rc,
+                    rows: None,
+                };
 
-fn eval_sql(conn: &Connection, sql: String, params: Option<eval::Params>) -> Result<(), Error> {
-    let mut stmt = conn.prepare(sql.as_str())?;
+                unsafe {
+                    rh.build_rows(|stmt| stmt.query(params![]).unwrap());
+                }
 
-    // let col_names = stmt.column_names();
-    let mut res = if let Some(p) = params {
-        todo!();
-    } else {
-        stmt.query([])?
-    };
-    // let col_names = stmt.column_names();
+                rows_handle = Some(Rc::new(RefCell::new(rh)));
+            }
+            Command::Fetch1 => {
+                let rh_rc = rows_handle.as_ref().unwrap().clone();
+                let mut rh = rh_rc.borrow_mut();
+                let rows = rh.rows.as_mut().unwrap();
 
-    let column_names = res.as_ref().unwrap().column_names();
-
-    let mut rows = array![];
-    while let Some(row) = res.next()? {
-        let mut row_obj = object![];
-        for (i, name) in column_names.iter().enumerate() {
-            let val = row.get_ref(i)?;
-            row_obj.insert(name.as_str(), val_to_json(val)).unwrap();
+                if let Some(row) = rows.next().unwrap() {
+                    let id: i32 = row.get("id").unwrap();
+                    let name: String = row.get("name").unwrap();
+                    println!("got row: {}, {}", id, name);
+                }
+            },
+            Command::Done => {
+                rows_handle = None;
+                stmt_handle = None;
+            },
         }
-        rows.push(row_obj);
     }
-
-    let j = json::stringify(rows);
-    stdout().write_fmt(format_args!("{}\n", j))?;
-    Ok(())
 }
