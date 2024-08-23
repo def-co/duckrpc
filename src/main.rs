@@ -1,5 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::pin::Pin;
+use std::ptr::addr_of_mut;
 
 use duckdb::{params, Connection, Rows, Statement};
 
@@ -19,19 +19,27 @@ const COMMANDS: &[Command] = &[
     Command::Done,
 ];
 
-type StatementCell<'a> = RefCell<Statement<'a>>;
-type StatementRc<'a> = Rc<StatementCell<'a>>;
-type RhRc<'a> = Rc<RefCell<RowsHandle<'a>>>;
-
-struct RowsHandle<'a> {
-    stmt_rc: Rc<RefCell<Statement<'a>>>,
+struct StmtHandle<'a> {
+    stmt: Statement<'a>,
     rows: Option<Rows<'a>>,
 }
-impl<'a> RowsHandle<'a> {
-    // SAFETY: Skirts around ownership rules for Rc, so assumes that it will live long enough.
-    unsafe fn build_rows<F: FnOnce(&'a mut Statement<'a>) -> Rows<'a>>(&mut self, f: F) {
-        let ptr = self.stmt_rc.as_ptr();
-        let ptr_ref = ptr.as_mut().unwrap();
+
+impl<'a> StmtHandle<'a> {
+    fn new(stmt: Statement<'a>) -> Self {
+        StmtHandle { stmt, rows: None }
+    }
+
+    fn build_rows<F>(mut self: Pin<&mut Self>, f: F)
+    where
+        F: FnOnce(&'a mut Statement<'a>) -> Rows<'a>,
+    {
+        // SAFETY: lifetime of `rows` will be the same as `stmt`, and it is
+        // not allowed to move via `Pin`, so taking a pointer in a self-referential
+        // fashion is okay.
+        let ptr_ref = unsafe {
+            let ptr = addr_of_mut!(self.stmt);
+            ptr.as_mut().unwrap()
+        };
         let rows = f(ptr_ref);
         self.rows = Some(rows);
     }
@@ -40,8 +48,7 @@ impl<'a> RowsHandle<'a> {
 fn main() {
     let db = Connection::open_in_memory().unwrap();
 
-    let mut stmt_handle: Option<StatementRc<'_>> = None;
-    let mut rows_handle: Option<RhRc<'_>> = None;
+    let mut stmt_handle: Option<Pin<Box<StmtHandle<'_>>>> = None;
 
     db.execute(
         "
@@ -62,37 +69,27 @@ fn main() {
         match command {
             Command::Prepare => {
                 let stmt = db.prepare("select * from items").unwrap();
-                stmt_handle = Some(Rc::new(RefCell::new(stmt)));
+                let sh = StmtHandle::new(stmt);
+                stmt_handle = Some(Box::pin(sh));
             }
             Command::Query => {
-                let stmt_rc = stmt_handle.as_ref().unwrap().clone();
-
-                let mut rh = RowsHandle {
-                    stmt_rc,
-                    rows: None,
-                };
-
-                unsafe {
-                    rh.build_rows(|stmt| stmt.query(params![]).unwrap());
-                }
-
-                rows_handle = Some(Rc::new(RefCell::new(rh)));
+                let sh = stmt_handle.as_mut().unwrap();
+                sh.as_mut()
+                    .build_rows(|stmt| stmt.query(params![]).unwrap());
             }
             Command::Fetch1 => {
-                let rh_rc = rows_handle.as_ref().unwrap().clone();
-                let mut rh = rh_rc.borrow_mut();
-                let rows = rh.rows.as_mut().unwrap();
+                let sh = stmt_handle.as_mut().unwrap();
 
-                if let Some(row) = rows.next().unwrap() {
+                if let Some(row) = sh.rows.as_mut().unwrap().next().unwrap() {
                     let id: i32 = row.get("id").unwrap();
                     let name: String = row.get("name").unwrap();
                     println!("got row: {}, {}", id, name);
                 }
-            },
+            }
             Command::Done => {
-                rows_handle = None;
+                // rows_handle = None;
                 stmt_handle = None;
-            },
+            }
         }
     }
 }
