@@ -14,16 +14,27 @@ import (
 type hdl func(map[string]any) error
 
 type Server struct {
-	db    *sql.DB
+	db *sql.DB
+
+	// c is a shared connection reused for the message handler.
+	// It is not reused for appenders which run in separate threads.
+	c *sql.Conn
+
 	stdin *bufio.Reader
 	hdls  map[string]hdl
 	qs    prober[*sql.Rows]
 	as    prober[*appender]
 }
 
-func NewServer(db *sql.DB) *Server {
+func NewServer(db *sql.DB) (*Server, error) {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		db:    db,
+		c:     conn,
 		stdin: bufio.NewReader(os.Stdin),
 		qs:    newProber[*sql.Rows](),
 		as:    newProber[*appender](),
@@ -38,7 +49,7 @@ func NewServer(db *sql.DB) *Server {
 		CommandAppenderInsert:  s.cmdAppenderInsert,
 		CommandAppenderRelease: s.cmdAppenderRelease,
 	}
-	return s
+	return s, nil
 }
 
 func (s *Server) Loop() error {
@@ -112,7 +123,7 @@ func (s *Server) cmdExecute(args map[string]any) error {
 		return err
 	}
 
-	res, err := s.db.Exec(query.Sql, query.Args...)
+	res, err := s.c.ExecContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return err
 	}
@@ -152,7 +163,7 @@ func (s *Server) cmdQueryHandle(args map[string]any) error {
 		return err
 	}
 
-	rows, err := s.db.Query(query.Sql, query.Args...)
+	rows, err := s.c.QueryContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -247,7 +258,7 @@ func (s *Server) cmdQueryImmediate(args map[string]any) error {
 		return err
 	}
 
-	rows, err := s.db.Query(query.Sql, query.Args...)
+	rows, err := s.c.QueryContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -290,9 +301,8 @@ func (s *Server) cmdAppender(args map[string]any) error {
 
 	conn, err := s.db.Conn(context.Background())
 	if err != nil {
-		panic(fmt.Errorf("get conn: %w", err))
+		return fmt.Errorf("connect: %w", err)
 	}
-
 	app, err := startAppender(conn, "main", table)
 	if err != nil {
 		return err

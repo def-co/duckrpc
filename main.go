@@ -22,7 +22,11 @@ func mainDo() int {
 		return 1
 	}
 
-	s := NewServer(db)
+	s, err := NewServer(db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		return 1
+	}
 
 	if err := s.Loop(); err != nil {
 		fmt.Fprintf(os.Stderr, "processing failed: %s\n", err)
