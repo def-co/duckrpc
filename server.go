@@ -13,12 +13,14 @@ import (
 type Server struct {
 	db    *sql.DB
 	stdin *bufio.Reader
+	qs    prober[*sql.Rows]
 }
 
 func NewServer(db *sql.DB) *Server {
 	return &Server{
 		db:    db,
 		stdin: bufio.NewReader(os.Stdin),
+		qs:    newProber[*sql.Rows](),
 	}
 }
 
@@ -61,6 +63,16 @@ func (s *Server) ProcessOne() (bool, error) {
 
 	case CommandQueryImmediate:
 		s.cmdQueryImmediate(msg.Args)
+		return true, nil
+
+	case CommandQuery:
+		s.cmdQueryHandle(msg.Args)
+		return true, nil
+	case CommandQueryFetch:
+		s.cmdQueryFetch(msg.Args)
+		return true, nil
+	case CommandQueryRelease:
+		s.cmdQueryRelease(msg.Args)
 		return true, nil
 
 	default:
@@ -133,6 +145,105 @@ func fetchRow(rows *sql.Rows, cols int) ([]any, error) {
 	return row, nil
 }
 
+func (s *Server) cmdQueryHandle(args map[string]any) {
+	query, err := parseQuery(args)
+	if err != nil {
+		s.respondErr(err)
+	}
+
+	rows, err := s.db.Query(query.Sql, query.Args...)
+	if err != nil {
+		s.respondErr(fmt.Errorf("query: %w", err))
+		return
+	}
+
+	cols, err := rows.Columns()
+	if err != nil {
+		s.respondErr(fmt.Errorf("get columns: %w", err))
+		return
+	}
+
+	k := s.qs.Insert(rows)
+
+	s.respond(map[string]any{
+		"ok": true,
+		"h":  k,
+		"c":  cols,
+	})
+}
+
+func (s *Server) cmdQueryFetch(args map[string]any) {
+	numRows, err := jsonGet[int](args, "n")
+	if err != nil {
+		s.respondErr(err)
+		return
+	}
+
+	handle, err := jsonGet[int](args, "h")
+	if err != nil {
+		s.respondErr(err)
+		return
+	}
+
+	query, ok := s.qs.Get(handle)
+	if !ok {
+		s.respondErr(fmt.Errorf("no such handle"))
+	}
+	cols, err := query.Columns()
+	if err != nil {
+		panic(fmt.Errorf("consistency error: could not fetch cols anymore: %w", err))
+	}
+	colCount := len(cols)
+
+	eof := false
+	rows := []any{}
+	for i := 0; i < numRows; i += 1 {
+		if !query.Next() {
+			eof = true
+			break
+		}
+
+		if row, err := fetchRow(query, colCount); err != nil {
+			s.respondErr(fmt.Errorf("row scan: %w", err))
+			return
+		} else {
+			rows = append(rows, row)
+		}
+	}
+
+	resp := map[string]any{
+		"ok":  true,
+		"r":   rows,
+		"eof": eof,
+	}
+
+	if err := query.Err(); err != nil {
+		resp["ok"] = false
+		resp["err"] = err.Error()
+	}
+
+	s.respond(resp)
+}
+
+func (s *Server) cmdQueryRelease(args map[string]any) {
+	handle, err := jsonGet[int](args, "h")
+	if err != nil {
+		s.respondErr(err)
+		return
+	}
+
+	query, ok := s.qs.Get(handle)
+	if !ok {
+		s.respondErr(fmt.Errorf("no such query"))
+		return
+	}
+
+	query.Close()
+	s.qs.Release(handle)
+
+	s.respondOk()
+}
+
 func (s *Server) cmdQueryImmediate(args map[string]any) {
 	query, err := parseQuery(args)
 	if err != nil {
@@ -145,6 +256,7 @@ func (s *Server) cmdQueryImmediate(args map[string]any) {
 		s.respondErr(fmt.Errorf("query: %w", err))
 		return
 	}
+	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {

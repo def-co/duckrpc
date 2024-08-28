@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -9,6 +10,9 @@ var (
 	CommandExecute        = "e"
 	CommandEnd            = "x"
 	CommandQueryImmediate = "qq"
+	CommandQuery          = "q"
+	CommandQueryFetch     = "qf"
+	CommandQueryRelease   = "qx"
 )
 
 type RpcMsg struct {
@@ -41,13 +45,18 @@ type Query struct {
 
 func parseQuery(data map[string]any) (Query, error) {
 	var q Query
-	if sql, ok := data["q"].(string); !ok {
-		return q, fmt.Errorf("invalid query: q key missing")
+
+	if sql, err := jsonGet[string](data, "q"); err != nil {
+		return q, err
 	} else {
 		q.Sql = sql
 	}
 
-	if args, ok := data["p"].([]any); ok {
+	if args, err := jsonGet[[]any](data, "p"); err != nil {
+		if !errors.Is(err, errMissingKey) {
+			return q, err
+		}
+	} else {
 		q.Args = args
 	}
 
