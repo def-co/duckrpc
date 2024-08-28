@@ -7,12 +7,15 @@ import (
 )
 
 var (
-	CommandExecute        = "e"
-	CommandEnd            = "x"
-	CommandQueryImmediate = "qq"
-	CommandQuery          = "q"
-	CommandQueryFetch     = "qf"
-	CommandQueryRelease   = "qx"
+	CommandExecute         = "e"
+	CommandEnd             = "x"
+	CommandQueryImmediate  = "qq"
+	CommandQuery           = "q"
+	CommandQueryFetch      = "qf"
+	CommandQueryRelease    = "qx"
+	CommandAppender        = "a"
+	CommandAppenderInsert  = "ai"
+	CommandAppenderRelease = "ax"
 )
 
 type RpcMsg struct {
