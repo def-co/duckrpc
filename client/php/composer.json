@@ -1,0 +1,17 @@
+{
+    "name": "paulsnar/duckrpc-client",
+    "type": "library",
+    "license": "0BSD",
+    "autoload": {
+        "psr-4": {
+            "PN\\DuckRpc\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "paulsnar",
+            "email": "paulsnar@paulsnar.lv"
+        }
+    ],
+    "require": {}
+}

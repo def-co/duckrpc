@@ -44,7 +44,7 @@ func NewServer(db *sql.DB) (*Server, error) {
 		CommandQueryImmediate:  s.cmdQueryImmediate,
 		CommandQuery:           s.cmdQueryHandle,
 		CommandQueryFetch:      s.cmdQueryFetch,
-		CommandQueryRelease:    s.cmdQueryHandle,
+		CommandQueryRelease:    s.cmdQueryRelease,
 		CommandAppender:        s.cmdAppender,
 		CommandAppenderInsert:  s.cmdAppenderInsert,
 		CommandAppenderRelease: s.cmdAppenderRelease,

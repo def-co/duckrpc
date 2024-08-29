@@ -1,3 +1,4 @@
 /test.db
 /.vscode
 /server/duckrpc
+/client/php/vendor
