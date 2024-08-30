@@ -22,6 +22,16 @@ class Appender
         ]);
     }
 
+    private function call(string $method, array $args): object
+    {
+        try {
+            return ($this->call)($method, $args);
+        } catch (\Throwable $exc) {
+            $this->isCommitted = true;
+            throw $exc;
+        }
+    }
+
     public function insertRow(array $row): void
     {
         $this->insertRows([$row]);
@@ -29,7 +39,7 @@ class Appender
 
     public function insertRows(array $rows): void
     {
-        ($this->call)('ai', [
+        $this->call('ai', [
             'h' => $this->handle,
             'r' => $rows,
         ]);
@@ -37,7 +47,7 @@ class Appender
 
     public function commit(): void
     {
-        ($this->call)('ax', [
+        $this->call('ax', [
             'h' => $this->handle,
         ]);
         $this->isCommitted = true;
