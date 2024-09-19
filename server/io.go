@@ -7,6 +7,8 @@ import (
 )
 
 var (
+	CommandConnect         = "c"
+	CommandDisconnect      = "cx"
 	CommandExecute         = "e"
 	CommandEnd             = "x"
 	CommandQueryImmediate  = "qq"

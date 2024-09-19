@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 
@@ -9,20 +8,7 @@ import (
 )
 
 func mainDo() int {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s dbname\n", os.Args[0])
-		return 64
-	}
-
-	dbname := os.Args[1]
-
-	db, err := sql.Open("duckdb", dbname)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "could not open database: %s\n", err)
-		return 1
-	}
-
-	s, err := NewServer(db)
+	s, err := NewServer()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		return 1

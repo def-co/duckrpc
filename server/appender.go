@@ -9,12 +9,14 @@ import (
 )
 
 type appender struct {
+	db   *sql.DB
 	open bool
 	comm chan any
 }
 
-func startAppender(conn *sql.Conn, schema, table string) (*appender, error) {
+func startAppender(db *sql.DB, conn *sql.Conn, schema, table string) (*appender, error) {
 	app := &appender{
+		db:   db,
 		open: true,
 		comm: make(chan any),
 	}

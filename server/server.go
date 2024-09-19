@@ -13,33 +13,39 @@ import (
 
 type hdl func(map[string]any) error
 
-type Server struct {
+type dbc struct {
 	db *sql.DB
 
-	// c is a shared connection reused for the message handler.
-	// It is not reused for appenders which run in separate threads.
-	c *sql.Conn
-
-	stdin *bufio.Reader
-	hdls  map[string]hdl
-	qs    prober[*sql.Rows]
-	as    prober[*appender]
+	// conn is a shared connection used for the message handler for any queries
+	// run via Execute or Query commands.
+	// Appenders run in separate threads and use their own conns.
+	conn *sql.Conn
 }
 
-func NewServer(db *sql.DB) (*Server, error) {
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return nil, err
-	}
+type q struct {
+	conn *sql.Conn
+	rows *sql.Rows
+}
 
+type Server struct {
+	stdin *bufio.Reader
+	hdls  map[string]hdl
+
+	ds prober[*dbc]
+	qs prober[q]
+	as prober[*appender]
+}
+
+func NewServer() (*Server, error) {
 	s := &Server{
-		db:    db,
-		c:     conn,
 		stdin: bufio.NewReader(os.Stdin),
-		qs:    newProber[*sql.Rows](),
+		ds:    newProber[*dbc](),
+		qs:    newProber[q](),
 		as:    newProber[*appender](),
 	}
 	s.hdls = map[string]hdl{
+		CommandConnect:         s.cmdConnect,
+		CommandDisconnect:      s.cmdDisconnect,
 		CommandExecute:         s.cmdExecute,
 		CommandQueryImmediate:  s.cmdQueryImmediate,
 		CommandQuery:           s.cmdQueryHandle,
@@ -117,13 +123,81 @@ func (s *Server) respondErr(err error) {
 	})
 }
 
+func (s *Server) cmdConnect(args map[string]any) error {
+	path, err := jsonGet[string](args, "p")
+	if err != nil {
+		return err
+	}
+
+	db, err := sql.Open("duckdb", path)
+	if err != nil {
+		return err
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return err
+	}
+
+	k := s.ds.Insert(&dbc{db, conn})
+
+	s.respond(map[string]any{
+		"ok": true,
+		"d":  k,
+	})
+	return nil
+}
+
+func (s *Server) cmdDisconnect(args map[string]any) error {
+	handle, err := jsonGet[int](args, "d")
+	if err != nil {
+		return err
+	}
+
+	dbc, ok := s.ds.Get(handle)
+	if !ok {
+		return fmt.Errorf("no such connection")
+	}
+
+	for k, q := range s.qs.Vals {
+		if q.conn == dbc.conn {
+			q.rows.Close()
+			s.qs.Release(k)
+		}
+	}
+	for k, a := range s.as.Vals {
+		if a.db == dbc.db {
+			a.Close()
+			s.as.Release(k)
+		}
+	}
+
+	dbc.conn.Close()
+	dbc.db.Close()
+
+	s.ds.Release(handle)
+
+	s.respondOk()
+	return nil
+}
+
 func (s *Server) cmdExecute(args map[string]any) error {
+	dbHandle, err := jsonGet[int](args, "d")
+	if err != nil {
+		return err
+	}
+	dbc, ok := s.ds.Get(dbHandle)
+	if !ok {
+		return fmt.Errorf("invalid connection handle")
+	}
+
 	query, err := parseQuery(args)
 	if err != nil {
 		return err
 	}
 
-	res, err := s.c.ExecContext(context.Background(), query.Sql, query.Args...)
+	res, err := dbc.conn.ExecContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return err
 	}
@@ -158,12 +232,21 @@ func fetchRow(rows *sql.Rows, cols int) ([]any, error) {
 }
 
 func (s *Server) cmdQueryHandle(args map[string]any) error {
+	dbHandle, err := jsonGet[int](args, "d")
+	if err != nil {
+		return err
+	}
+	dbc, ok := s.ds.Get(dbHandle)
+	if !ok {
+		return fmt.Errorf("invalid connection handle")
+	}
+
 	query, err := parseQuery(args)
 	if err != nil {
 		return err
 	}
 
-	rows, err := s.c.QueryContext(context.Background(), query.Sql, query.Args...)
+	rows, err := dbc.conn.QueryContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -173,7 +256,7 @@ func (s *Server) cmdQueryHandle(args map[string]any) error {
 		return fmt.Errorf("get columns: %w", err)
 	}
 
-	k := s.qs.Insert(rows)
+	k := s.qs.Insert(q{dbc.conn, rows})
 
 	s.respond(map[string]any{
 		"ok": true,
@@ -198,7 +281,7 @@ func (s *Server) cmdQueryFetch(args map[string]any) error {
 	if !ok {
 		return fmt.Errorf("no such handle")
 	}
-	cols, err := query.Columns()
+	cols, err := query.rows.Columns()
 	if err != nil {
 		panic(fmt.Errorf("consistency error: could not fetch cols anymore: %w", err))
 	}
@@ -207,12 +290,12 @@ func (s *Server) cmdQueryFetch(args map[string]any) error {
 	eof := false
 	rows := []any{}
 	for i := 0; i < numRows; i += 1 {
-		if !query.Next() {
+		if !query.rows.Next() {
 			eof = true
 			break
 		}
 
-		if row, err := fetchRow(query, colCount); err != nil {
+		if row, err := fetchRow(query.rows, colCount); err != nil {
 			return fmt.Errorf("row scan: %w", err)
 		} else {
 			rows = append(rows, row)
@@ -225,7 +308,7 @@ func (s *Server) cmdQueryFetch(args map[string]any) error {
 		"eof": eof,
 	}
 
-	if err := query.Err(); err != nil {
+	if err := query.rows.Err(); err != nil {
 		resp["ok"] = false
 		resp["err"] = err.Error()
 	}
@@ -245,7 +328,7 @@ func (s *Server) cmdQueryRelease(args map[string]any) error {
 		return fmt.Errorf("no such query")
 	}
 
-	query.Close()
+	query.rows.Close()
 	s.qs.Release(handle)
 
 	s.respondOk()
@@ -253,12 +336,21 @@ func (s *Server) cmdQueryRelease(args map[string]any) error {
 }
 
 func (s *Server) cmdQueryImmediate(args map[string]any) error {
+	dbHandle, err := jsonGet[int](args, "d")
+	if err != nil {
+		return err
+	}
+	dbc, ok := s.ds.Get(dbHandle)
+	if !ok {
+		return fmt.Errorf("invalid connection handle")
+	}
+
 	query, err := parseQuery(args)
 	if err != nil {
 		return err
 	}
 
-	rows, err := s.c.QueryContext(context.Background(), query.Sql, query.Args...)
+	rows, err := dbc.conn.QueryContext(context.Background(), query.Sql, query.Args...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -294,16 +386,25 @@ func (s *Server) cmdQueryImmediate(args map[string]any) error {
 }
 
 func (s *Server) cmdAppender(args map[string]any) error {
+	dbHandle, err := jsonGet[int](args, "d")
+	if err != nil {
+		return err
+	}
+	dbc, ok := s.ds.Get(dbHandle)
+	if !ok {
+		return fmt.Errorf("invalid connection handle")
+	}
+
 	table, err := jsonGet[string](args, "t")
 	if err != nil {
 		return err
 	}
 
-	conn, err := s.db.Conn(context.Background())
+	conn, err := dbc.db.Conn(context.Background())
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	app, err := startAppender(conn, "main", table)
+	app, err := startAppender(dbc.db, conn, "main", table)
 	if err != nil {
 		return err
 	}
