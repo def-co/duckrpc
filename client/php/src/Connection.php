@@ -4,92 +4,18 @@ namespace PN\DuckRpc;
 
 class Connection
 {
-    public static string $executablePath;
-
     private int $dbHandle;
-    private $proc;
-    private $stdin;
-    private $stdout;
-    private $stderr;
 
     public function __construct(
         string $dbName,
+        private Process $proc = new Process(),
     ) {
-        $this->proc = proc_open(
-            command: [
-                self::$executablePath,
-                $dbName,
-            ],
-            descriptor_spec: [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ],
-            pipes: $pipes,
-        );
-
-        if (!$this->proc) {
-            throw new \RuntimeException('failed to proc_open');
-        }
-
-        $this->stdin = $pipes[0];
-        $this->stdout = $pipes[1];
-        $this->stderr = $pipes[2];
-
-        $res = $this->read();
-        if (!$res->ok) {
-            array_map(fclose(...), $pipes);
-            throw new \RuntimeException("failed to boot: {$res->err}");
-        }
-
-        $res = $this->call('c', ['p' => $dbName]);
-        if (!$res->ok) {
-            throw new \RuntimeException("failed to open db: {$res->err}");
-        }
-        $this->dbHandle = $res->d;
-    }
-
-    public function __destruct()
-    {
-        $this->call('x', []);
-        array_map(fclose(...), [$this->stdin, $this->stdout, $this->stderr]);
-        proc_close($this->proc);
-    }
-
-    private function read(): object
-    {
-        $line = fgets($this->stdout);
-        return json_decode($line, flags: JSON_THROW_ON_ERROR);
-    }
-
-    private function write(string $method, array $args): void
-    {
-        $req = new \stdClass();
-        $req->{'@'} = $method;
-        foreach ($args as $key => $value) {
-            $req->{$key} = $value;
-        }
-
-        $line = json_encode(
-            $req,
-            flags: JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
-        ) . "\n";
-        fwrite($this->stdin, $line);
-    }
-
-    private function call(string $method, array $args): object
-    {
-        $this->write($method, $args);
-        $re = $this->read();
-        if (!$re->ok) {
-            throw new \RuntimeException($re->err);
-        }
-        return $re;
+        $this->dbHandle = $this->proc->call('c', ['p' => $dbName])->d;
     }
 
     public function execute(string $query, array $params = []): void
     {
-        $this->call('e', [
+        $this->proc->call('e', [
             'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
@@ -98,14 +24,14 @@ class Connection
 
     public function select(string $query, array $params = []): Rows
     {
-        $re = $this->call('q', [
+        $re = $this->proc->call('q', [
             'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
         ]);
 
         return new Rows(
-            $this->call(...),
+            $this->proc->call(...),
             $re->h,
             $re->c,
         );
@@ -122,7 +48,7 @@ class Connection
 
     public function selectValue(string $query, array $params = []): mixed
     {
-        $re = $this->call('q', [
+        $re = $this->proc->call('q', [
             'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
@@ -130,13 +56,13 @@ class Connection
         $handle = $re->h;
 
         try {
-            $re = $this->call('qf', [
+            $re = $this->proc->call('qf', [
                 'h' => $handle,
                 'n' => 1,
             ]);
             return $re->r[0][0];
         } finally {
-            $this->call('qx', [
+            $this->proc->call('qx', [
                 'h' => $handle,
             ]);
         }
@@ -144,7 +70,7 @@ class Connection
 
     public function selectAll(string $query, array $params = []): array
     {
-        $re = $this->call('qq', [
+        $re = $this->proc->call('qq', [
             'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
@@ -164,13 +90,13 @@ class Connection
 
     public function appender(string $table): Appender
     {
-        $re = $this->call('a', [
+        $re = $this->proc->call('a', [
             'd' => $this->dbHandle,
             't' => $table,
         ]);
 
         return new Appender(
-            $this->call(...),
+            $this->proc->call(...),
             $re->h,
         );
     }
