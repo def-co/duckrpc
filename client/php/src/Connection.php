@@ -6,6 +6,7 @@ class Connection
 {
     public static string $executablePath;
 
+    private int $dbHandle;
     private $proc;
     private $stdin;
     private $stdout;
@@ -40,6 +41,12 @@ class Connection
             array_map(fclose(...), $pipes);
             throw new \RuntimeException("failed to boot: {$res->err}");
         }
+
+        $res = $this->call('c', ['p' => $dbName]);
+        if (!$res->ok) {
+            throw new \RuntimeException("failed to open db: {$res->err}");
+        }
+        $this->dbHandle = $res->d;
     }
 
     public function __destruct()
@@ -83,6 +90,7 @@ class Connection
     public function execute(string $query, array $params = []): void
     {
         $this->call('e', [
+            'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
         ]);
@@ -91,6 +99,7 @@ class Connection
     public function select(string $query, array $params = []): Rows
     {
         $re = $this->call('q', [
+            'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
         ]);
@@ -114,6 +123,7 @@ class Connection
     public function selectValue(string $query, array $params = []): mixed
     {
         $re = $this->call('q', [
+            'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
         ]);
@@ -135,6 +145,7 @@ class Connection
     public function selectAll(string $query, array $params = []): array
     {
         $re = $this->call('qq', [
+            'd' => $this->dbHandle,
             'q' => $query,
             'p' => $params,
         ]);
@@ -154,6 +165,7 @@ class Connection
     public function appender(string $table): Appender
     {
         $re = $this->call('a', [
+            'd' => $this->dbHandle,
             't' => $table,
         ]);
 
